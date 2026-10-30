@@ -33,10 +33,22 @@ def silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     if gate.device.type != "cuda" or up.device.type != "cuda":
         raise ValueError("Inputs must be CUDA tensors")
 
+    if gate.device != up.device:
+        raise ValueError("Inputs must be on the same device")
+
     if not gate.is_contiguous() or not up.is_contiguous():
         raise ValueError("Inputs must be contiguous")
 
     output = torch.empty_like(gate)
     n = gate.numel()
 
-    silu_mul_
+    silu_mul_kernel[(triton.cdiv(n, 1024),)](
+        gate,
+        up,
+        output,
+        n,
+        1024,
+        num_warps=4,
+    )
+
+    return output
