@@ -124,3 +124,73 @@ def triton_cross_entropy_split(logits, targets, block=4096):
     )
 
     return losses
+
+@triton.jit
+def _ce_backward_kernel(
+    X,
+    Y,
+    LSE,
+    GRAD,
+    N_COLS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    IGNORE_INDEX: tl.constexpr,
+    SCALE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    chunk = tl.program_id(1)
+
+    col = chunk * BLOCK + tl.arange(0, BLOCK)
+    mask = col < N_COLS
+
+    target = tl.load(Y + row).to(tl.int32)
+    lse = tl.load(LSE + row)
+
+    x = tl.load(
+        X + row * N_COLS + col,
+        mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    grad = tl.exp(x - lse) - (col == target).to(tl.float32)
+    grad = grad * SCALE
+
+    grad = tl.where(target == IGNORE_INDEX, 0.0, grad)
+
+    tl.store(
+        GRAD + row * N_COLS + col,
+        grad,
+        mask,
+    )
+
+
+def triton_cross_entropy_backward(
+    logits,
+    targets,
+    lse,
+    scale,
+    block=4096,
+    ignore_index=-100,
+):
+    n_rows, n_cols = logits.shape
+
+    grad = torch.empty(
+        logits.shape,
+        device=logits.device,
+        dtype=torch.float32,
+    )
+
+    chunks = triton.cdiv(n_cols, block)
+
+    _ce_backward_kernel[(n_rows, chunks)](
+        logits,
+        targets,
+        lse,
+        grad,
+        n_cols,
+        block,
+        ignore_index,
+        scale,
+        num_warps=4,
+    )
+
+    return grad
