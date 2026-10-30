@@ -194,3 +194,56 @@ def triton_cross_entropy_backward(
     )
 
     return grad
+
+class TritonCrossEntropyFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, logits, targets):
+        n_rows, n_cols = logits.shape
+
+        valid = targets != -100
+        valid_count = valid.sum().item()
+
+        if valid_count == 0:
+            raise ValueError("All targets are ignored")
+
+        losses = triton_cross_entropy_split(
+            logits,
+            targets,
+        )
+
+        loss = losses[valid].mean()
+
+        lse = torch.logsumexp(
+            logits.detach().float(),
+            dim=1,
+        )
+
+        ctx.save_for_backward(
+            logits,
+            targets,
+            lse,
+        )
+
+        ctx.scale = 1.0 / valid_count
+
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, targets, lse = ctx.saved_tensors
+
+        grad = triton_cross_entropy_backward(
+            logits,
+            targets,
+            lse,
+            ctx.scale,
+        )
+
+        grad = grad * grad_output
+
+        return grad.to(logits.dtype), None
+
+
+def triton_cross_entropy_autograd(logits, targets):
+    return TritonCrossEntropyFunction.apply(logits, targets)
