@@ -1,41 +1,65 @@
-import sys
 import torch
-import torch.nn.functional as F
+import triton
+import triton.language as tl
 
-sys.path.insert(0, "/kaggle/working/repo")
 
-from solution.triton_ce import triton_cross_entropy
+@triton.jit
+def _ce_forward_kernel(
+    X,
+    Y,
+    LOSS,
+    N_ROWS: tl.constexpr,
+    N_COLS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
 
-torch.manual_seed(42)
+    x = tl.load(
+        X + row * N_COLS + col,
+        col < N_COLS,
+        other=-float("inf"),
+    ).to(tl.float32)
 
-N = 32
-C = 1024
+    maximum = tl.max(x, axis=0)
+    log_sum_exp = maximum + tl.log(
+        tl.sum(tl.exp(x - maximum), axis=0)
+    )
 
-logits = torch.randn(
-    N, C,
-    device="cuda",
-    dtype=torch.float16,
-)
+    target = tl.load(Y + row).to(tl.int32)
+    target_logit = tl.load(
+        X + row * N_COLS + target
+    ).to(tl.float32)
 
-targets = torch.randint(
-    0, C,
-    (N,),
-    device="cuda",
-)
+    loss = log_sum_exp - target_logit
+    tl.store(LOSS + row, loss)
 
-reference = F.cross_entropy(
-    logits.float(),
-    targets,
-    reduction="none",
-)
 
-result = triton_cross_entropy(logits, targets)
+def triton_cross_entropy(logits, targets):
+    assert logits.is_cuda
+    assert targets.is_cuda
+    assert logits.ndim == 2
+    assert targets.ndim == 1
+    assert logits.shape[0] == targets.shape[0]
 
-print("PyTorch first 5:", reference[:5])
-print("Triton first 5:", result[:5])
+    n_rows, n_cols = logits.shape
 
-print("Max absolute error:",
-      (reference - result).abs().max().item())
+    losses = torch.empty(
+        (n_rows,),
+        device=logits.device,
+        dtype=torch.float32,
+    )
 
-print("All close:",
-      torch.allclose(reference, result, atol=1e-5, rtol=1e-5))
+    block = triton.next_power_of_2(n_cols)
+
+    _ce_forward_kernel[(n_rows,)](
+        logits,
+        targets,
+        losses,
+        n_rows,
+        n_cols,
+        block,
+        num_warps=4,
+    )
+
+    return losses
